@@ -5,20 +5,27 @@
 #   1. Аудит открытых портов (ss) и опубликованных портов Docker
 #   2. UFW: SSH и VPN-порты — для всех, порт ноды — только с IP панели
 #   3. fail2ban: SSH + recidive, IP панели в белом списке
-#   4. Разбор портов Docker, которые идут в обход UFW, и как их закрыть
+#   4. Уведомления в Telegram (по желанию): отчёт, баны fail2ban, входы по SSH
+#   5. Разбор портов Docker, которые идут в обход UFW, и как их закрыть
 #
 #  Запуск:
 #    sudo bash node-guard.sh                      # интерактивно
 #    sudo bash node-guard.sh --audit              # только проверка, без изменений
 #    sudo bash node-guard.sh --panel-ip 1.2.3.4 --node-port 2222 --ports 443/tcp -y
+#    sudo bash node-guard.sh ... --tg-token 123:AA... --tg-id 123456789 -y
 #
 #  Debian 11+ / Ubuntu 20.04+
 # =============================================================================
 set -uo pipefail
 export LC_ALL=C LANG=C   # стабильный вывод ufw/ss/fail2ban независимо от локали
+shopt -u patsub_replacement 2>/dev/null || true   # bash 5.2+: «&» в ${x//a/b} — не подстановка
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 readonly F2B_JAIL="/etc/fail2ban/jail.d/node-guard.local"
+readonly TG_CONF="/etc/node-guard/telegram.conf"
+readonly NOTIFY_BIN="/usr/local/bin/node-guard-notify"
+readonly F2B_TG_ACTION="/etc/fail2ban/action.d/node-guard-telegram.conf"
+readonly PAM_SSHD="/etc/pam.d/sshd"
 readonly RB_UNIT="node-guard-rollback-$$"
 
 # Процессы, чьи публичные порты предлагается открыть для всех
@@ -37,6 +44,13 @@ AUDIT_ONLY=0
 SKIP_F2B=0
 NO_ROLLBACK=0
 ROLLBACK_SEC=180
+TG_TOKEN=""       # токен бота от @BotFather
+TG_CHAT_ID=""     # USER_ID в Telegram (или ID группы, с минусом)
+TG_NODE_NAME=""   # подпись ноды в уведомлениях, по умолчанию hostname
+TG_API="https://api.telegram.org"
+TG_NOTIFY_BANS=1
+TG_NOTIFY_LOGINS=1
+TG_DISABLE=0
 
 # ── состояние ────────────────────────────────────────────────────────────────
 L_PROTO=(); L_PORT=(); L_PROC=(); L_SCOPE=(); L_ADDR=()   # scope: 1 lo, 2 LAN, 3 наружу, 4 Docker
@@ -44,7 +58,9 @@ D_HOST=(); D_LOCAL=(); D_EXP=()
 declare -A DOCKER_PORTS=()
 DOCKER_OK=0; REMNANODE=""; NODE_PORT_DET=""
 SSH_ARR=(); PANEL_ARR=(); VPN_ARR=(); CLOSED=()
-APT_UPDATED=0; RB_MODE=""; RB_PID=""; F2B_OK=0; DOCKER_SECTION=6
+APT_UPDATED=0; RB_MODE=""; RB_PID=""; F2B_OK=0; SEC=0
+TG_ENABLED=0; TG_REMOVE=0; TG_ERR=""
+NL=$'\n'
 
 # ── вывод ────────────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -59,6 +75,10 @@ warn() { printf '%s[!]%s %s\n' "$Y" "$N" "$*"; }
 err()  { printf '%s[✗]%s %s\n' "$R" "$N" "$*" >&2; }
 die()  { err "$*"; exit 1; }
 hdr()  { printf '\n%s%s━━ %s%s\n' "$BD" "$C" "$*" "$N"; }
+step() { SEC=$((SEC + 1)); hdr "$SEC. $*"; }
+html() { local s=$1; s=${s//&/&amp;}; s=${s//</&lt;}; s=${s//>/&gt;}; printf '%s' "$s"; }
+sq()   { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+yn()   { if (( $1 )); then printf 'да'; else printf 'нет'; fi; }
 join() { local sep=$1 out="" x; shift; for x in "$@"; do out+="${out:+$sep}$x"; done; printf '%s' "$out"; }
 trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; s=${s%"${s##*[![:space:]]}"}; printf '%s' "$s"; }
 in_list() { local x=$1 y; shift; for y in "$@"; do [[ $x == "$y" ]] && return 0; done; return 1; }
@@ -306,7 +326,7 @@ f2b_state() {
 
 # ── 1. аудит ─────────────────────────────────────────────────────────────────
 print_audit() {
-  hdr "1. Открытые порты"
+  step "Открытые порты"
   if ((${#L_PORT[@]} == 0)); then warn "Не удалось получить список портов (ss)"; return; fi
   local i addr lbl pub=0
   printf '  %s%-5s %-6s %-24s %-16s %s%s\n' "$BD" PROTO PORT ADDRESS PROCESS "доступ" "$N"
@@ -432,7 +452,7 @@ ask_vpn_ports() {
     warn "Слушают наружу, но по умолчанию будут закрыты: $(join ', ' "${other[@]}")"
     say "    Если какой-то из них нужен снаружи — допишите его в список ниже."
   fi
-  ((${#D_EXP[@]})) && info "Порты Docker в этот список добавлять не нужно — UFW на них не действует (см. раздел 6)."
+  ((${#D_EXP[@]})) && info "Порты Docker в этот список добавлять не нужно — UFW на них не действует (разбор в конце)."
 
   v=${VPN_PORTS:-$(join ',' "${cand[@]}")}
   while :; do
@@ -478,10 +498,113 @@ compute_closed() {
   done
 }
 
+# ── Telegram: ввод и проверка ────────────────────────────────────────────────
+tg_send() {   # tg_send "HTML-текст" → 0 при успехе, иначе причина в TG_ERR
+  local resp
+  TG_ERR=""
+  resp=$(curl -sS -m 15 -K - \
+           --data-urlencode "chat_id=$TG_CHAT_ID" --data-urlencode "text=$1" \
+           -d parse_mode=HTML -d disable_web_page_preview=true \
+           2>&1 <<<"url = \"${TG_API%/}/bot$TG_TOKEN/sendMessage\"")
+  [[ $resp == *'"ok":true'* ]] && return 0
+  TG_ERR=$(sed -nE 's/.*"description":"([^"]*)".*/\1/p' <<<"$resp" | head -n1)
+  [[ -n $TG_ERR ]] || TG_ERR=$(head -n1 <<<"${resp:-нет ответа}")
+  return 1
+}
+
+tg_hint() {
+  case $TG_ERR in
+    *Unauthorized*|*"Not Found"*)
+      say "    → Неверный токен. Скопируйте его ещё раз у @BotFather." ;;
+    *"chat not found"*)
+      say "    → Откройте своего бота в Telegram и нажмите /start (с аккаунта $TG_CHAT_ID), потом повторите." ;;
+    *blocked*)
+      say "    → Бот у вас заблокирован — разблокируйте его и нажмите /start." ;;
+    *curl*|*resolve*|*"timed out"*|*onnect*)
+      say "    → Нет связи с $TG_API — проверьте сеть и DNS сервера." ;;
+  esac
+}
+
+load_tg_conf() {
+  local name_flag=$TG_NODE_NAME
+  [[ -r $TG_CONF ]] || return 1
+  # shellcheck source=/dev/null
+  . "$TG_CONF" 2>/dev/null || return 1
+  [[ -n $name_flag ]] && TG_NODE_NAME=$name_flag
+  [[ -n $TG_TOKEN && -n $TG_CHAT_ID ]]
+}
+
+ask_telegram() {
+  local def_token="" def_id=""
+  if (( TG_DISABLE )); then
+    [[ -e $TG_CONF ]] && TG_REMOVE=1
+    return 0
+  fi
+  if [[ -n $TG_TOKEN || -n $TG_CHAT_ID ]]; then
+    [[ -n $TG_TOKEN && -n $TG_CHAT_ID ]] || die "Для Telegram нужны оба флага: --tg-token и --tg-id"
+  elif load_tg_conf; then
+    if confirm "Уведомления в Telegram уже настроены (ID $TG_CHAT_ID, нода «$TG_NODE_NAME»). Оставить как есть?" Y; then
+      TG_ENABLED=1
+      ok "Telegram: текущие настройки сохранены"
+      return 0
+    fi
+    def_token=$TG_TOKEN def_id=$TG_CHAT_ID TG_TOKEN="" TG_CHAT_ID=""
+    if ! confirm "Перенастроить уведомления? (n — отключить их)" Y; then TG_REMOVE=1; return 0; fi
+  else
+    noninteractive && return 0
+    confirm "Присылать уведомления в Telegram? (отчёт, баны fail2ban, входы по SSH)" N || return 0
+  fi
+
+  if [[ -z $TG_TOKEN ]]; then
+    say "    Бот: создайте его в @BotFather (/newbot) и скопируйте токен. Свой USER_ID покажет @userinfobot."
+    say "    Перед проверкой откройте своего бота и нажмите /start — иначе он не сможет вам писать."
+  fi
+  if ! command -v curl >/dev/null 2>&1 && ! install_pkgs curl; then
+    warn "Без curl уведомления не настроить — пропускаю"; TG_TOKEN="" TG_CHAT_ID=""; return 0
+  fi
+  while :; do
+    if [[ -z $TG_TOKEN ]]; then ask "TOKEN бота" "$def_token"; TG_TOKEN=$REPLY; fi
+    if [[ ! $TG_TOKEN =~ ^[0-9]{5,}:[A-Za-z0-9_-]{30,}$ ]]; then
+      warn "Это не похоже на токен бота (вид: 123456789:AAH...)"
+      if noninteractive; then warn "Telegram не настроен — проверьте --tg-token"; TG_TOKEN="" TG_CHAT_ID=""; return 0; fi
+      TG_TOKEN=""; continue
+    fi
+    if [[ -z $TG_CHAT_ID ]]; then ask "Ваш USER_ID в Telegram" "$def_id"; TG_CHAT_ID=$REPLY; fi
+    if [[ ! $TG_CHAT_ID =~ ^-?[0-9]{3,}$ ]]; then
+      warn "USER_ID — это число, например 123456789 (у групп — с минусом)"
+      if noninteractive; then warn "Telegram не настроен — проверьте --tg-id"; TG_TOKEN="" TG_CHAT_ID=""; return 0; fi
+      TG_CHAT_ID=""; continue
+    fi
+    if [[ -z $TG_NODE_NAME ]]; then ask "Подпись этой ноды в уведомлениях" "$(hostname)"; TG_NODE_NAME=$REPLY; fi
+    info "Отправляю тестовое сообщение…"
+    if tg_send "✅ <b>$(html "$TG_NODE_NAME")</b> · node-guard${NL}Уведомления подключены, тест прошёл."; then
+      ok "Тестовое сообщение доставлено — проверьте Telegram"
+      break
+    fi
+    err "Telegram ответил: $TG_ERR"
+    tg_hint
+    if noninteractive || ! confirm "Попробовать ещё раз? (данные можно поправить)" Y; then
+      warn "Уведомления в Telegram не будут настроены"; TG_TOKEN="" TG_CHAT_ID=""
+      return 0
+    fi
+    def_token=$TG_TOKEN def_id=$TG_CHAT_ID TG_TOKEN="" TG_CHAT_ID=""
+  done
+
+  TG_ENABLED=1
+  if (( SKIP_F2B )); then
+    TG_NOTIFY_BANS=0
+  elif confirm "Присылать баны fail2ban? (на публичном сервере их бывает несколько в час)" Y; then
+    TG_NOTIFY_BANS=1
+  else
+    TG_NOTIFY_BANS=0
+  fi
+  if confirm "Присылать уведомления о входе по SSH?" Y; then TG_NOTIFY_LOGINS=1; else TG_NOTIFY_LOGINS=0; fi
+}
+
 # ── 3. план ──────────────────────────────────────────────────────────────────
 print_plan() {
   local p it ip
-  hdr "3. План"
+  step "План"
   say "  ${BD}Для всех:${N}"
   for p in "${SSH_ARR[@]}"; do say "    • $p/tcp — SSH"; done
   for it in "${VPN_ARR[@]}"; do
@@ -494,7 +617,16 @@ print_plan() {
   if (( !SKIP_F2B )); then
     say "  ${BD}fail2ban:${N} SSH — 5 ошибок за 10 мин → бан 1 ч, повторно дольше (до недели); IP панели в белом списке"
   fi
-  ((${#D_EXP[@]})) && say "  ${Y}Docker-порты (${#D_EXP[@]} шт.) UFW не закроет — инструкция в разделе 6${N}"
+  if (( TG_ENABLED )); then
+    local -a what=("отчёт")
+    (( TG_NOTIFY_BANS )) && what+=("баны fail2ban")
+    (( TG_NOTIFY_LOGINS )) && what+=("входы по SSH")
+    say "  ${BD}Telegram:${N} ID $TG_CHAT_ID — $(join ', ' "${what[@]}")"
+  elif (( TG_REMOVE )); then
+    say "  ${BD}Telegram:${N} уведомления будут отключены"
+  fi
+  ((${#D_EXP[@]})) && say "  ${Y}Docker-порты (${#D_EXP[@]} шт.) UFW не закроет — инструкция в конце${N}"
+  return 0
 }
 
 # ── 4. UFW ───────────────────────────────────────────────────────────────────
@@ -569,7 +701,7 @@ confirm_access() {
 
 apply_ufw() {
   local has_rules=0 added p ip it guard=0
-  hdr "4. UFW"
+  step "UFW"
   install_pkgs ufw || die "Без ufw продолжать нельзя"
   [[ -f /etc/default/ufw ]] && sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
 
@@ -618,9 +750,164 @@ apply_ufw() {
   return 0
 }
 
+# ── Telegram: установка ──────────────────────────────────────────────────────
+write_tg_conf() {
+  mkdir -p "${TG_CONF%/*}" && chmod 700 "${TG_CONF%/*}"
+  ( umask 077
+    {
+      say "# node-guard: уведомления в Telegram. Можно править вручную — применяется сразу."
+      say "TG_TOKEN=$(sq "$TG_TOKEN")"
+      say "TG_CHAT_ID=$(sq "$TG_CHAT_ID")"
+      say "TG_NODE_NAME=$(sq "$TG_NODE_NAME")"
+      say "TG_NOTIFY_BANS=$TG_NOTIFY_BANS     # 1 — присылать баны fail2ban, 0 — нет"
+      say "TG_NOTIFY_LOGINS=$TG_NOTIFY_LOGINS   # 1 — присылать входы по SSH, 0 — нет"
+      say "# Свой адрес Bot API, если api.telegram.org с сервера недоступен"
+      say "TG_API=$(sq "$TG_API")"
+    } >"$TG_CONF"
+  )
+  chmod 600 "$TG_CONF"
+}
+
+write_notifier() {
+  cat >"$NOTIFY_BIN" <<'NOTIFY'
+#!/usr/bin/env bash
+# node-guard-notify — уведомления node-guard в Telegram (создано node-guard.sh)
+#   node-guard-notify test
+#   node-guard-notify ban <jail> <ip> <failures>     ← fail2ban
+#   node-guard-notify login                          ← pam_exec (sshd)
+#   node-guard-notify report < текст.html
+# Настройки: /etc/node-guard/telegram.conf
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+shopt -u patsub_replacement 2>/dev/null || true
+CONF=/etc/node-guard/telegram.conf
+[[ -r $CONF ]] || exit 0
+# shellcheck source=/dev/null
+. "$CONF"
+[[ -n ${TG_TOKEN:-} && -n ${TG_CHAT_ID:-} ]] || exit 0
+API=${TG_API:-https://api.telegram.org}
+NODE=${TG_NODE_NAME:-$(hostname)}
+NL=$'\n'
+
+h() { local s=$1; s=${s//&/&amp;}; s=${s//</&lt;}; s=${s//>/&gt;}; printf '%s' "$s"; }
+
+send() {
+  local resp
+  resp=$(curl -sS -m 15 -K - \
+           --data-urlencode "chat_id=$TG_CHAT_ID" --data-urlencode "text=$1" \
+           -d parse_mode=HTML -d disable_web_page_preview=true \
+           2>&1 <<<"url = \"${API%/}/bot$TG_TOKEN/sendMessage\"")
+  [[ $resp == *'"ok":true'* ]] && return 0
+  printf '%s\n' "$resp" >&2
+  return 1
+}
+
+# Отправка в фоне: не задерживаем ни fail2ban, ни вход по SSH
+send_bg() { ( send "$1" >/dev/null 2>&1 & ); }
+
+case ${1:-} in
+  test)
+    send "✅ <b>$(h "$NODE")</b> · node-guard${NL}Тестовое сообщение."
+    exit $? ;;
+  ban)
+    [[ ${TG_NOTIFY_BANS:-1} == 1 ]] || exit 0
+    ip=${3:-?}
+    send_bg "🚫 <b>$(h "$NODE")</b> · fail2ban <code>$(h "${2:-?}")</code>${NL}Забанен <a href=\"https://ipinfo.io/$(h "$ip")\">$(h "$ip")</a>, ошибок: $(h "${4:-?}")" ;;
+  login)
+    [[ ${TG_NOTIFY_LOGINS:-1} == 1 && ${PAM_TYPE:-} == open_session ]] || exit 0
+    ip=${PAM_RHOST:-?}
+    send_bg "🔑 <b>$(h "$NODE")</b> · вход по SSH${NL}Пользователь: <code>$(h "${PAM_USER:-?}")</code>${NL}С адреса: <a href=\"https://ipinfo.io/$(h "$ip")\">$(h "$ip")</a>${NL}$(date '+%F %T %Z')" ;;
+  report)
+    send "$(cat)"
+    exit $? ;;
+  *)
+    echo "Использование: node-guard-notify test | ban <jail> <ip> <failures> | login | report < text" >&2
+    exit 2 ;;
+esac
+exit 0
+NOTIFY
+  chmod 755 "$NOTIFY_BIN"
+}
+
+write_f2b_tg_action() {
+  mkdir -p "${F2B_TG_ACTION%/*}"
+  cat >"$F2B_TG_ACTION" <<EOF
+# Создано node-guard.sh — уведомления о банах в Telegram через $NOTIFY_BIN
+[Definition]
+# не слать повторно баны, восстановленные после перезапуска fail2ban
+norestored  = 1
+actionstart =
+actionstop  =
+actioncheck =
+actionban   = $NOTIFY_BIN ban <name> <ip> <failures>
+actionunban =
+EOF
+}
+
+apply_telegram() {
+  if (( TG_REMOVE )); then
+    step "Telegram"
+    rm -f "$TG_CONF"
+    [[ -f $PAM_SSHD ]] && sed -i '/node-guard-notify/d' "$PAM_SSHD"
+    ok "Уведомления в Telegram отключены"
+    return 0
+  fi
+  (( TG_ENABLED )) || return 0
+  step "Telegram"
+  install_pkgs curl || { warn "Без curl уведомления работать не будут"; TG_ENABLED=0; return 1; }
+  write_tg_conf
+  write_notifier
+  if (( !SKIP_F2B )) || [[ -d /etc/fail2ban ]]; then write_f2b_tg_action; fi
+  # Строка в PAM ставится всегда: включать и выключать входы можно в $TG_CONF.
+  # optional — если отправка не удастся, вход по SSH это не заблокирует.
+  if [[ -f $PAM_SSHD ]]; then
+    sed -i '/node-guard-notify/d' "$PAM_SSHD"
+    printf '%s\n' "# node-guard-notify: уведомление о входе по SSH в Telegram" \
+      "session optional pam_exec.so quiet $NOTIFY_BIN login" >>"$PAM_SSHD"
+  else
+    warn "Нет $PAM_SSHD — уведомления о входе по SSH не подключены"
+  fi
+  if (( TG_NOTIFY_LOGINS )) && [[ $(sshd -T 2>/dev/null | awk '$1=="usepam"{print $2}') == no ]]; then
+    warn "В sshd выключен UsePAM — уведомления о входе приходить не будут"
+  fi
+  ok "Настройки: $TG_CONF (только root)"
+  ok "Отчёт: да · баны fail2ban: $(yn "$TG_NOTIFY_BANS") · входы по SSH: $(yn "$TG_NOTIFY_LOGINS")"
+}
+
+server_ip() {
+  ip -o route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
+}
+
+tg_report() {
+  (( TG_ENABLED )) || return 0
+  local t e name hport cport n=0 p ufw_s f2b_s sip
+  local -a open=()
+  for p in "${SSH_ARR[@]}"; do open+=("$p/tcp"); done
+  open+=("${VPN_ARR[@]}")
+  if ufw status 2>/dev/null | grep -q '^Status: active'; then ufw_s="включён"; else ufw_s="⚠️ выключен"; fi
+  if (( F2B_OK )); then f2b_s="работает"; else f2b_s="не настроен"; fi
+
+  t="🛡 <b>$(html "$TG_NODE_NAME")</b> · node-guard${NL}"
+  sip=$(server_ip)
+  t+="Сервер: <code>$(html "$(hostname)")${sip:+ · $sip}</code>${NL}${NL}"
+  t+="<b>UFW</b>: $ufw_s${NL}"
+  t+="Для всех: $(html "$(join ', ' "${open[@]}")")${NL}"
+  t+="Порт ноды $NODE_PORT ← $(html "$(join ', ' "${PANEL_ARR[@]}")")${NL}"
+  ((${#CLOSED[@]})) && t+="Закрыто: $(html "$(join ', ' "${CLOSED[@]}")")${NL}"
+  t+="<b>fail2ban</b>: $f2b_s${NL}"
+  if ((${#D_EXP[@]})); then
+    t+="${NL}⚠️ <b>Docker мимо UFW</b>:${NL}"
+    for e in "${D_EXP[@]}"; do
+      if (( ++n > 10 )); then t+="… и ещё $(( ${#D_EXP[@]} - 10 ))${NL}"; break; fi
+      IFS='|' read -r name _ hport cport _ <<<"$e"
+      t+="• $(html "$name") — $hport → $(html "$cport")${NL}"
+    done
+  fi
+  if tg_send "$t"; then ok "Отчёт отправлен в Telegram"; else warn "Отчёт в Telegram не отправился: $TG_ERR"; fi
+}
+
 # ── 5. fail2ban ──────────────────────────────────────────────────────────────
-write_jail() {   # write_jail <backend> <recidive 0|1>
-  local backend=$1 rec=$2 ignore="127.0.0.1/8 ::1" ip
+write_jail() {   # write_jail <backend> <recidive 0|1> <telegram 0|1>
+  local backend=$1 rec=$2 tg=${3:-0} ignore="127.0.0.1/8 ::1" ip
   for ip in "${PANEL_ARR[@]}"; do ignore+=" $ip"; done
   {
     printf '# Создано node-guard.sh %s. Повторный запуск скрипта перезапишет файл.\n\n' "$(date '+%F %T')"
@@ -634,6 +921,14 @@ findtime           = 10m
 maxretry           = 5
 banaction          = iptables-multiport
 banaction_allports = iptables-allports
+EOF
+    if (( tg )); then
+      cat <<'EOF'
+action             = %(action_)s
+                     node-guard-telegram
+EOF
+    fi
+    cat <<EOF
 
 [sshd]
 enabled  = true
@@ -657,23 +952,29 @@ EOF
 apply_fail2ban() {
   local backend=auto i
   local -a pkgs=(fail2ban)
-  hdr "5. fail2ban"
+  step "fail2ban"
   if (( SKIP_F2B )); then info "Пропущено (--no-fail2ban)"; return 0; fi
   if [[ ! -s /var/log/auth.log ]]; then backend=systemd; pkgs+=(python3-systemd); fi
   install_pkgs "${pkgs[@]}" || return 1
   mkdir -p /etc/fail2ban/jail.d
   [[ -e /var/log/fail2ban.log ]] || touch /var/log/fail2ban.log
 
-  write_jail "$backend" 1
-  if ! fail2ban-client -t >/dev/null 2>&1; then
-    write_jail "$backend" 0
-    if ! fail2ban-client -t >/dev/null 2>&1; then
-      err "Конфиг fail2ban не прошёл проверку:"
-      fail2ban-client -t 2>&1 | tail -n 15 | sed 's/^/    /' >&2
-      return 1
-    fi
-    warn "recidive выключен (fail2ban не пишет лог в файл)"
+  # пробуем полный конфиг, при ошибке — без recidive, затем без Telegram
+  local tg=$TG_ENABLED rec=1 tg_on=0 t good=0
+  local -a tries=("1 $tg" "0 $tg")
+  (( tg )) && tries+=("0 0")
+  for t in "${tries[@]}"; do
+    read -r rec tg_on <<<"$t"
+    write_jail "$backend" "$rec" "$tg_on"
+    if fail2ban-client -t >/dev/null 2>&1; then good=1; break; fi
+  done
+  if (( !good )); then
+    err "Конфиг fail2ban не прошёл проверку:"
+    fail2ban-client -t 2>&1 | tail -n 15 | sed 's/^/    /' >&2
+    return 1
   fi
+  (( rec )) || warn "recidive выключен (fail2ban не пишет лог в файл)"
+  (( tg && !tg_on )) && warn "Уведомления о банах не подключились к fail2ban"
   systemctl enable fail2ban >/dev/null 2>&1
   if ! systemctl restart fail2ban; then
     err "fail2ban не перезапустился — смотрите: journalctl -u fail2ban -n 30"; return 1
@@ -691,7 +992,7 @@ apply_fail2ban() {
 report_docker() {
   local e name hip hport cport cfg wd svc cp pr sfx dc ext_if c first_port="" ccfg cwd csvc
   local -a names=()
-  hdr "$DOCKER_SECTION. Docker: порты в обход UFW"
+  step "Docker: порты в обход UFW"
   if (( !DOCKER_OK )); then info "Docker не найден или не запущен — проверять нечего."; return 0; fi
 
   for e in "${D_HOST[@]}"; do ok "${e%%|*} — network_mode: host, его порты закрывает UFW"; done
@@ -760,7 +1061,8 @@ summary() {
     fail2ban-client status sshd 2>/dev/null | sed 's/^/  /'
   fi
   ((${#CLOSED[@]})) && { say ""; ok "Закрыто для интернета: $(join ', ' "${CLOSED[@]}")"; }
-  ((${#D_EXP[@]})) && warn "Осталось Docker-портов в обход UFW: ${#D_EXP[@]} — см. раздел 6"
+  ((${#D_EXP[@]})) && warn "Осталось Docker-портов в обход UFW: ${#D_EXP[@]} — как закрыть, написано выше"
+  (( TG_ENABLED )) && ok "Telegram: настройки в $TG_CONF, проверка: $NOTIFY_BIN test"
   say ""
   say "${BD}Полезное${N}"
   say "  ufw status numbered                      правила UFW"
@@ -768,6 +1070,7 @@ summary() {
   say "  ufw delete <номер>                       удалить правило"
   say "  fail2ban-client status sshd              кто забанен"
   say "  fail2ban-client set sshd unbanip <IP>    разбанить"
+  (( TG_ENABLED )) && say "  node-guard-notify test                   тестовое сообщение в Telegram"
   say "  Сменился IP панели или порты — просто запустите скрипт ещё раз."
 }
 
@@ -786,6 +1089,10 @@ node-guard.sh v$VERSION — защита ноды Remnawave (аудит порт
   --no-reset           оставить существующие правила UFW и дописать свои
   --no-fail2ban        не настраивать fail2ban
   --no-rollback        без страховочного автоотката UFW
+  --tg-token TOKEN     токен Telegram-бота (вместе с --tg-id включает уведомления)
+  --tg-id ID           ваш USER_ID в Telegram (или ID группы)
+  --tg-name NAME       подпись ноды в уведомлениях (по умолчанию hostname)
+  --no-telegram        без уведомлений (если были — отключить)
   --audit              только проверка портов и Docker, ничего не менять
   -y, --yes            без вопросов (значения по умолчанию / из флагов)
   -h, --help           эта справка
@@ -798,7 +1105,7 @@ EOF
 }
 
 parse_args() {
-  need() { [[ $# -ge 2 && -n $2 && ( $2 != -* || $2 == - ) ]] || die "Опции $1 нужно значение (см. --help)"; }
+  need() { [[ $# -ge 2 && -n $2 && ( $2 != -* || $2 == - || $2 =~ ^-[0-9]+$ ) ]] || die "Опции $1 нужно значение (см. --help)"; }
   while (($#)); do
     case $1 in
       --panel-ip)   need "$@"; PANEL_IPS=$2; shift 2 ;;
@@ -813,6 +1120,13 @@ parse_args() {
       --no-reset)   RESET_UFW=no; shift ;;
       --no-fail2ban) SKIP_F2B=1; shift ;;
       --no-rollback) NO_ROLLBACK=1; shift ;;
+      --tg-token)   need "$@"; TG_TOKEN=$2; shift 2 ;;
+      --tg-token=*) TG_TOKEN=${1#*=}; shift ;;
+      --tg-id)      need "$@"; TG_CHAT_ID=$2; shift 2 ;;
+      --tg-id=*)    TG_CHAT_ID=${1#*=}; shift ;;
+      --tg-name)    need "$@"; TG_NODE_NAME=$2; shift 2 ;;
+      --tg-name=*)  TG_NODE_NAME=${1#*=}; shift ;;
+      --no-telegram) TG_DISABLE=1; shift ;;
       --audit)      AUDIT_ONLY=1; shift ;;
       -y|--yes)     ASSUME_YES=1; shift ;;
       -h|--help)    usage; exit 0 ;;
@@ -834,7 +1148,6 @@ main() {
   print_audit
 
   if (( AUDIT_ONLY )); then
-    DOCKER_SECTION=2
     report_docker
     exit 0
   fi
@@ -847,20 +1160,23 @@ main() {
     die "Нет терминала для вопросов. Запустите с -y и --panel-ip (см. --help)"
   fi
 
-  hdr "2. Параметры"
+  step "Параметры"
   ask_ssh_ports
   ask_node_port
   ask_panel_ips
   ask_vpn_ports
+  ask_telegram
   compute_closed
   print_plan
 
   if ! confirm "Применить?" Y; then info "Отменено, ничего не изменено."; exit 0; fi
 
   apply_ufw
+  apply_telegram
   apply_fail2ban || warn "fail2ban не настроен — UFW при этом работает"
   report_docker
   summary
+  tg_report
 }
 
 main "$@"
