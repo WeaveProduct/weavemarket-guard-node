@@ -1,9 +1,9 @@
-# node-guard
+# weavemarket-guard-node
 
 Скрипт защиты ноды **Remnawave**: проверяет открытые порты, настраивает **UFW** и **fail2ban**, оставляет порт ноды открытым только для IP панели и показывает, какие порты Docker торчат в интернет в обход UFW и как их закрыть.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/WeaveProduct/node-guard/main/node-guard.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/WeaveProduct/weavemarket-guard-node/main/node-guard.sh)
 ```
 
 ---
@@ -32,7 +32,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/WeaveProduct/node-guard/main
 Сначала посмотрите, что открыто на сервере. Этот режим ничего не меняет:
 
 ```bash
-wget -O node-guard.sh https://raw.githubusercontent.com/WeaveProduct/node-guard/main/node-guard.sh
+wget -O node-guard.sh https://raw.githubusercontent.com/WeaveProduct/weavemarket-guard-node/main/node-guard.sh
 sudo bash node-guard.sh --audit
 ```
 
